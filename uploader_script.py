@@ -131,14 +131,12 @@ async def download_video_and_upload(link):
     YT_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
     YT_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
-    if not all([TG_API_ID, TG_API_HASH, TG_SESSION_STRING, YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN]):
-        print("🔴 Missing one or more required secrets. Please check your GitHub Secrets setup.")
-        # If running locally to generate the session string, only the TG secrets are required
-        if not TG_SESSION_STRING:
-            print("\n--- INITIATING TELEGRAM SESSION GENERATOR ---\n")
-            await generate_telegram_session(TG_API_ID, TG_API_HASH)
-            return
-        
+    # MODIFIED: When running the main flow (with a link), we check for ALL necessary secrets.
+    # If any are missing, we exit immediately, preventing the interactive prompt.
+    required_secrets = [TG_API_ID, TG_API_HASH, TG_SESSION_STRING, YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN]
+    if not all(required_secrets):
+        print("🔴 Missing one or more required secrets. Cannot proceed with upload.")
+        print("Please ensure TG_API_ID, TG_API_HASH, TG_SESSION_STRING, YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and YOUTUBE_REFRESH_TOKEN are all set as environment variables (GitHub Secrets).")
         sys.exit(1)
 
     # 2. Parse the input link
@@ -202,6 +200,14 @@ async def generate_telegram_session(api_id, api_hash):
 
     # Use a fixed session name 'temp_session'
     client = TelegramClient('temp_session', api_id, api_hash)
+    
+    # NOTE: client.start() here is what prompts for phone number/token using input(),
+    # which requires an interactive terminal.
+    print("\n--- ATTENTION ---")
+    print("You must run this command in a LOCAL, INTERACTIVE terminal (not in the CI/CD environment).")
+    print("The script is about to prompt you for your phone number or bot token.")
+    print("-----------------\n")
+
     await client.start()
     
     print("\n-------------------------------------------------------------")
