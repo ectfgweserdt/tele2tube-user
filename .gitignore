@@ -1,0 +1,17 @@
+Environment files
+
+.env
+
+Python specific
+
+pycache/
+*.pyc
+*.session  # Telegram session file
+*.json     # YouTube credentials file
+
+Temporary files created by the script (video download)
+
+*.mp4
+*.mkv
+*.mov
+*.avi
