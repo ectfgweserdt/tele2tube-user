@@ -34,6 +34,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
         
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        
       - name: Run Uploader Script
         # We pass the entire input string to the script
         run: python uploader_script.py "${{ github.event.inputs.telegram_links }}"
