@@ -1,18 +1,21 @@
-name: Run Telegram to YouTube Batch Uploader
+name: Run Telegram to YouTube Uploader
 
 on:
   workflow_dispatch:
     inputs:
-      telegram_links:
-        description: 'Comma-separated Telegram links (e.g., https://t.me/c/1/10, https://t.me/c/1/11)'
+      telegram_link:
+        description: 'Single link or multiple links separated by commas'
         required: true
         type: string
-      
+
+# Ensure only one upload runs at a time to prevent IP conflicts
+concurrency: 
+  group: telegram-upload
+  cancel-in-progress: false 
+
 jobs:
   upload:
     runs-on: ubuntu-latest
-    # Added a timeout of 3 hours just in case you provide many large files
-    timeout-minutes: 180 
     
     env:
       TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -33,12 +36,13 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install System Dependencies (FFmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python Dependencies
         run: pip install -r requirements.txt
         
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-        
       - name: Run Uploader Script
-        # We pass the entire input string to the script
-        run: python uploader_script.py "${{ github.event.inputs.telegram_links }}"
+        run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
