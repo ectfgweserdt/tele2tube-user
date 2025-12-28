@@ -21,7 +21,9 @@ import googleapiclient.errors
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 IMAGEN_MODEL = "imagen-4.0-generate-001"
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+
+# Fetching the API Key
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
 
 def run_command(command):
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
@@ -31,28 +33,34 @@ def run_command(command):
 def download_progress_callback(current, total):
     print(f"⏳ Telegram Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.2f}%)", end='\r', flush=True)
 
+def clean_fallback_title(filename):
+    name = os.path.splitext(filename)[0]
+    name = re.sub(r'(_|\.|\-)', ' ', name)
+    tags = [
+        r'\d{3,4}p', 'HD', 'NF', 'WEB-DL', 'Dual Audio', 'ES', 'x264', 'x265', 
+        'HEVC', 'BluRay', 'HDRip', 'AAC', '5.1', '10bit'
+    ]
+    for tag in tags:
+        name = re.sub(tag, '', name, flags=re.IGNORECASE)
+    return ' '.join(name.split()).strip()
+
 # --- AI METADATA ---
 async def get_ai_metadata(filename):
     print(f"🤖 Calling Gemini AI for metadata: {filename}")
     
-    # Pre-clean filename for the prompt
-    clean_name = filename.replace('_', ' ').replace('.', ' ')
-    
     if not GEMINI_API_KEY:
-        print("⚠️ No GEMINI_API_KEY found in secrets! (Check GitHub Actions Secrets)")
-        # Improved fallback title cleanup if API is missing
-        fallback_title = re.sub(r'(_|\.mkv|\.mp4|\.avi|\.720p|\.1080p|HD|WEB-DL|Dual Audio)', ' ', filename).strip()
-        return {"title": fallback_title, "description": "High-quality series upload.", "image_prompt": fallback_title}
+        print(f"⚠️ GEMINI_API_KEY is EMPTY!")
+        title = clean_fallback_title(filename)
+        return {"title": title, "description": f"Series: {title}", "image_prompt": title}
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     
     prompt = (
-        f"You are a YouTube SEO expert. Analyze this filename: '{filename}'\n"
-        "REQUIRED ACTIONS:\n"
-        "1. CLEAN TITLE: Search for the real movie/series name. Return a beautiful title like 'Love, Death & Robots - Season 4 Episode 9'. Remove all technical tags like 720p, WEB-DL, Dual Audio, etc.\n"
-        "2. DESCRIPTION: Write a professional 3-paragraph summary. Include cast info and plot without spoilers. DO NOT include any external links or 'Auto-uploaded' text.\n"
-        "3. IMAGE PROMPT: Create a vivid, high-detail description for an AI image generator to create a cinematic poster for this specific content.\n"
-        "\nIMPORTANT: Your response must be valid JSON only."
+        f"You are a professional YouTube SEO manager. Analyze this file: '{filename}'\n"
+        "1. CLEAN TITLE: Search for the actual movie/series name and episode. Return ONLY the formal title (e.g., 'Love, Death & Robots - S04E09').\n"
+        "2. DESCRIPTION: Write 3 paragraphs of cinematic description. Use search tools for plot/cast. No links.\n"
+        "3. IMAGE PROMPT: A descriptive artistic prompt for a cinematic poster (no text).\n"
+        "Return ONLY JSON."
     )
     
     payload = {
@@ -63,37 +71,60 @@ async def get_ai_metadata(filename):
     
     try:
         res = requests.post(url, json=payload, timeout=45)
-        res.raise_for_status()
-        data = res.json()
-        raw_text = data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
-        json_str = re.sub(r'```json\n?|\n?```', '', raw_text).strip()
-        meta = json.loads(json_str)
-        if 'title' in meta:
-            print(f"✅ AI metadata generated: {meta['title']}")
-            return meta
+        if res.status_code == 200:
+            data = res.json()
+            raw_text = data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
+            meta = json.loads(raw_text)
+            if 'title' in meta:
+                print(f"✅ AI metadata generated: {meta['title']}")
+                return meta
     except Exception as e:
         print(f"⚠️ AI Metadata failed: {e}")
     
-    fallback_title = re.sub(r'(_|\.mkv|\.mp4|\.avi|\.720p|\.1080p|HD|WEB-DL|Dual Audio)', ' ', filename).strip()
-    return {"title": fallback_title, "description": f"Detailed video for {fallback_title}.", "image_prompt": fallback_title}
+    title = clean_fallback_title(filename)
+    return {"title": title, "description": f"Quality upload of {title}.", "image_prompt": title}
 
 async def generate_thumbnail(image_prompt):
     if not GEMINI_API_KEY: return None
-    print(f"🎨 Generating AI Thumbnail...")
+    print(f"🎨 Generating AI Thumbnail for: {image_prompt[:40]}...")
+    
+    # Try Imagen 4.0 first
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGEN_MODEL}:predict?key={GEMINI_API_KEY}"
     payload = {
         "instances": [{"prompt": f"Cinematic movie poster, digital art, high detail, masterpiece, no text: {image_prompt}"}],
         "parameters": {"sampleCount": 1}
     }
+    
     try:
         res = requests.post(url, json=payload, timeout=60)
-        res.raise_for_status()
-        data = res.json()
-        img_b64 = data.get('predictions', [{}])[0].get('bytesBase64Encoded')
-        if img_b64:
-            with open("thumbnail.png", "wb") as f:
-                f.write(base64.b64decode(img_b64))
-            return "thumbnail.png"
+        if res.status_code == 200:
+            data = res.json()
+            img_b64 = data.get('predictions', [{}])[0].get('bytesBase64Encoded')
+            if img_b64:
+                with open("thumbnail.png", "wb") as f:
+                    f.write(base64.b64decode(img_b64))
+                print("✅ Thumbnail generated successfully.")
+                return "thumbnail.png"
+        else:
+            print(f"⚠️ Thumbnail API Error ({res.status_code}): {res.text[:100]}")
+            
+            # FALLBACK: Try generating via Gemini-Image-Preview if Imagen fails
+            print("🔄 Attempting fallback image generation...")
+            fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key={GEMINI_API_KEY}"
+            fallback_payload = {
+                "contents": [{"parts": [{"text": f"Generate a cinematic movie poster for: {image_prompt}"}]}],
+                "generationConfig": {"responseModalities": ["IMAGE"]}
+            }
+            f_res = requests.post(fallback_url, json=fallback_payload, timeout=60)
+            if f_res.status_code == 200:
+                f_data = f_res.json()
+                f_b64 = f_data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[1].get('inlineData', {}).get('data')
+                if f_b64:
+                    with open("thumbnail.png", "wb") as f:
+                        f.write(base64.b64decode(f_b64))
+                    print("✅ Fallback thumbnail generated.")
+                    return "thumbnail.png"
+                    
     except Exception as e:
         print(f"⚠️ Thumbnail generation failed: {e}")
     return None
@@ -101,8 +132,7 @@ async def generate_thumbnail(image_prompt):
 # --- VIDEO PROCESSING ---
 def process_video(input_path):
     output_path = "processed_video.mp4"
-    print(f"\n🔍 Optimizing video and filtering for English audio...")
-    # FFmpeg: Pick English audio, convert to AAC, copy video stream
+    print(f"\n🔍 Extracting English audio track...")
     cmd_ffmpeg = (
         f"ffmpeg -i '{input_path}' "
         f"-map 0:v:0 -map 0:a:m:language:eng? -map 0:a:0? "
@@ -134,7 +164,7 @@ def upload_to_youtube(video_path, metadata, thumb_path):
             'status': {'privacyStatus': 'private'}
         }
         
-        print(f"🚀 Uploading: {body['snippet']['title']}")
+        print(f"🚀 Uploading to YouTube: {body['snippet']['title']}")
         media = MediaFileUpload(video_path, chunksize=1024*1024, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         
@@ -144,12 +174,19 @@ def upload_to_youtube(video_path, metadata, thumb_path):
             if status: print(f"Uploaded {int(status.progress() * 100)}%")
 
         video_id = response['id']
+        
         if thumb_path and os.path.exists(thumb_path):
-            time.sleep(5)
-            youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_path)).execute()
-            print("✅ Thumbnail applied!")
+            print(f"🖼️ Applying thumbnail to video {video_id}...")
+            # Wait 10 seconds for YouTube to "recognize" the video exists
+            time.sleep(10)
+            try:
+                youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_path)).execute()
+                print("✅ Thumbnail applied!")
+            except Exception as te:
+                print(f"⚠️ Thumbnail application failed: {te}")
             
         print(f"🎉 SUCCESS! https://youtu.be/{video_id}")
+        
     except Exception as e:
         print(f"🔴 YouTube Error: {e}")
 
@@ -160,9 +197,7 @@ async def run_flow(link):
         msg_id = int(parts[-1])
         c_idx = parts.index('c')
         chat_id = int(f"-100{parts[c_idx+1]}")
-    except:
-        print("Invalid link.")
-        return
+    except: return
 
     client = TelegramClient(StringSession(os.environ['TG_SESSION_STRING']), os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
     await client.start()
@@ -174,11 +209,14 @@ async def run_flow(link):
     await client.download_media(message, raw_file, progress_callback=download_progress_callback)
     await client.disconnect()
 
+    # Step 1: Get Metadata
     metadata = await get_ai_metadata(message.file.name or raw_file)
-    thumb_task = generate_thumbnail(metadata['image_prompt'])
+    
+    # Step 2: Start Thumbnail generation and Video processing
+    thumb_task = generate_thumbnail(metadata.get('image_prompt', ''))
     final_video = process_video(raw_file)
+    
     thumb = await thumb_task
-
     upload_to_youtube(final_video, metadata, thumb)
 
     for f in [raw_file, "processed_video.mp4", "thumbnail.png"]:
