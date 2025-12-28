@@ -36,109 +36,74 @@ def download_progress_callback(current, total):
 def parse_filename(filename):
     """Extracts title, season, and episode for better IMDb searching."""
     clean_name = os.path.splitext(filename)[0].replace('_', ' ').replace('.', ' ')
-    
-    # Try to find S01E01 patterns
     match = re.search(r'S(\d+)E(\d+)', clean_name, re.IGNORECASE)
     season, episode = None, None
     if match:
         season = match.group(1)
         episode = match.group(2)
-        # Remove SxxExx and everything after from the search term
         search_title = clean_name[:match.start()].strip()
     else:
-        # Fallback cleaning for movies
         tags = [r'\d{3,4}p', 'HD', 'NF', 'WEB-DL', 'Dual Audio', 'ES', 'x264', 'x265', 'HEVC']
         search_title = clean_name
         for tag in tags:
             search_title = re.sub(tag, '', search_title, flags=re.IGNORECASE)
         search_title = ' '.join(search_title.split()).strip()
-        
     return search_title, season, episode
 
-# --- METADATA ENGINE ---
 async def get_metadata(filename):
     search_title, season, episode = parse_filename(filename)
     print(f"\n🔍 Searching IMDb for: {search_title} " + (f"(S{season}E{episode})" if season else ""))
-    
     omdb_data = None
     if OMDB_API_KEY:
         try:
             url = f"http://www.omdbapi.com/?t={search_title}&apikey={OMDB_API_KEY}"
             if season: url += f"&Season={season}&Episode={episode}"
-            
             res = requests.get(url, timeout=10)
             data = res.json()
             if data.get("Response") == "True":
                 print(f"✅ IMDb Match: {data['Title']}")
                 omdb_data = data
-        except Exception as e:
-            print(f"⚠️ IMDb Search failed: {e}")
+        except: pass
 
-    # Use Gemini to polish the metadata into a "Neat" format
     if GEMINI_API_KEY:
         print("🤖 AI is formatting neat description...")
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        
         prompt = (
             f"Context: Filename is '{filename}'. IMDb Data: {json.dumps(omdb_data) if omdb_data else 'None found'}.\n\n"
-            "Task: Create NEAT YouTube metadata. Follow these rules exactly:\n"
-            "1. TITLE: Clean and formal. Example: 'Movie Name (Year)' or 'Series Name - S01E05 - Episode Name'. No technical tags.\n"
-            "2. DESCRIPTION: Must include these sections with emojis:\n"
-            "   🎬 SYNOPSIS: (3-4 sentences summarizing the plot)\n"
-            "   🎭 CAST & CREW: (List main actors and director)\n"
-            "   📌 DETAILS: (Release Year, Genre, IMDb Rating)\n"
-            "   🚀 Follow for more high-quality content!\n"
-            "3. TAGS: Provide 10 relevant SEO keywords separated by commas.\n\n"
-            "Return ONLY a JSON object with keys: 'title', 'description', 'tags'."
+            "Task: Create NEAT YouTube metadata. Return JSON with keys: 'title', 'description', 'tags'.\n"
+            "1. TITLE: Formal (e.g. 'Show - S01E01 - Title')\n"
+            "2. DESCRIPTION: Sections with emojis (Synopsis, Cast, Details).\n"
+            "3. TAGS: 10 comma-separated keywords."
         )
-
         try:
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json"}
-            }
+            payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
             res = requests.post(gemini_url, json=payload, timeout=30)
             if res.status_code == 200:
-                meta = json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
-                return meta
-        except Exception as e:
-            print(f"⚠️ AI Formatting failed: {e}")
+                return json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
+        except: pass
+    return {"title": search_title, "description": "High quality upload.", "tags": "video"}
 
-    # Final Fallback
-    return {
-        "title": omdb_data['Title'] if omdb_data else search_title,
-        "description": f"Plot: {omdb_data.get('Plot', 'No description available.')}\n\nUpload of {filename}",
-        "tags": "movies, series, entertainment"
-    }
-
-# --- FREE THUMBNAIL METHOD ---
 def generate_thumbnail_from_video(video_path):
-    print("🖼️ Extracting high-quality frame for thumbnail...")
+    print("🖼️ Extracting thumbnail...")
     output_thumb = "thumbnail.jpg"
     try:
         duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 '{video_path}'"
         duration_out, _, _ = run_command(duration_cmd)
-        # Take frame at 25% to avoid spoilers but miss intros
         seek_time = float(duration_out.strip()) / 4 if duration_out.strip() else 15
-        extract_cmd = f"ffmpeg -ss {seek_time} -i '{video_path}' -vframes 1 -q:v 2 -y {output_thumb}"
-        run_command(extract_cmd)
+        run_command(f"ffmpeg -ss {seek_time} -i '{video_path}' -vframes 1 -q:v 2 -y {output_thumb}")
         return output_thumb if os.path.exists(output_thumb) else None
     except: return None
 
-# --- VIDEO PROCESSING ---
 def process_video(input_path):
     output_path = "processed_video.mp4"
     print(f"🔍 Optimizing video & audio...")
-    # Keep video, keep English audio (or first track), convert to standard AAC
     cmd_ffmpeg = (
-        f"ffmpeg -i '{input_path}' "
-        f"-map 0:v:0 -map 0:a:m:language:eng? -map 0:a:0? "
+        f"ffmpeg -i '{input_path}' -map 0:v:0 -map 0:a:m:language:eng? -map 0:a:0? "
         f"-c:v copy -c:a aac -b:a 192k -y '{output_path}'"
     )
     _, _, code = run_command(cmd_ffmpeg)
     return output_path if code == 0 and os.path.exists(output_path) else input_path
 
-# --- YOUTUBE UPLOAD ---
 def upload_to_youtube(video_path, metadata, thumb_path):
     try:
         creds = Credentials(
@@ -150,90 +115,83 @@ def upload_to_youtube(video_path, metadata, thumb_path):
         )
         creds.refresh(Request())
         youtube = build('youtube', 'v3', credentials=creds)
-        
         body = {
             'snippet': {
-                'title': metadata.get('title', 'Video Upload')[:95],
-                'description': metadata.get('description', 'High quality content.'),
+                'title': metadata.get('title', 'Video')[:95],
+                'description': metadata.get('description', ''),
                 'tags': metadata.get('tags', '').split(','),
-                'categoryId': '24' # Entertainment
+                'categoryId': '24'
             },
             'status': {'privacyStatus': 'private'}
         }
-        
-        print(f"🚀 Uploading to YouTube: {body['snippet']['title']}")
+        print(f"🚀 Uploading: {body['snippet']['title']}")
         media = MediaFileUpload(video_path, chunksize=1024*1024, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-        
         response = None
         while response is None:
             status, response = request.next_chunk()
             if status: print(f"Uploaded {int(status.progress() * 100)}%")
-
-        video_id = response['id']
         
         if thumb_path:
-            print("🖼️ Applying thumbnail...")
-            time.sleep(10) # Wait for YouTube backend
-            try:
-                youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_path)).execute()
-                print("✅ Thumbnail set!")
+            # Shortened delay to reduce process time
+            time.sleep(5)
+            try: youtube.thumbnails().set(videoId=response['id'], media_body=MediaFileUpload(thumb_path)).execute()
             except: pass
-            
-        print(f"🎉 SUCCESS! Link: https://youtu.be/{video_id}")
-    except Exception as e:
+        print(f"🎉 SUCCESS! https://youtu.be/{response['id']}")
+        return True
+    except googleapiclient.errors.HttpError as e:
+        error_details = e.content.decode()
+        # Handle both global quota and per-user daily limits
+        if "uploadLimitExceeded" in error_details or "quotaExceeded" in error_details:
+            print("\n❌ API LIMIT REACHED!")
+            print("YouTube allows ~6 uploads per day via API for free projects.")
+            print("The limit will reset in 24 hours.")
+            return "LIMIT_REACHED"
         print(f"🔴 YouTube Error: {e}")
+        return False
+    except Exception as e:
+        print(f"🔴 Error: {e}")
+        return False
 
-# --- SINGLE LINK HANDLER ---
 async def process_single_link(client, link):
     try:
         print(f"\n--- Processing: {link} ---")
         parts = [p for p in link.strip('/').split('/') if p]
-        msg_id = int(parts[-1])
-        c_idx = parts.index('c')
-        chat_id = int(f"-100{parts[c_idx+1]}")
-    except Exception as e:
-        print(f"❌ Skipping invalid link {link}: {e}")
-        return
+        msg_id, chat_id = int(parts[-1]), int(f"-100{parts[parts.index('c')+1]}")
+    except: return True
 
     message = await client.get_messages(chat_id, ids=msg_id)
-    if not message or not message.media:
-        print("❌ Message contains no media.")
-        return
+    if not message or not message.media: return True
 
     raw_file = f"download_{msg_id}" + (message.file.ext if hasattr(message, 'file') else ".mp4")
-    print(f"⬇️ Downloading from Telegram...")
+    print(f"⬇️ Downloading...")
     await client.download_media(message, raw_file, progress_callback=download_progress_callback)
     
-    # Get Metadata (IMDb + AI formatting)
     metadata = await get_metadata(message.file.name or raw_file)
-    
-    # Video & Thumb
     final_video = process_video(raw_file)
     thumb = generate_thumbnail_from_video(final_video)
     
-    # Upload
-    upload_to_youtube(final_video, metadata, thumb)
+    status = upload_to_youtube(final_video, metadata, thumb)
 
-    # Cleanup
     for f in [raw_file, "processed_video.mp4", "thumbnail.jpg"]:
-        if os.path.exists(f): 
-            try: os.remove(f)
-            except: pass
+        if os.path.exists(f): os.remove(f)
+    return status
 
-# --- MAIN ---
 async def run_flow(links_str):
     links = [l.strip() for l in links_str.split(',') if l.strip()]
-    print(f"📦 Found {len(links)} links to process.")
-    
-    client = TelegramClient(StringSession(os.environ['TG_SESSION_STRING']), os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
+    client = TelegramClient(
+        StringSession(os.environ['TG_SESSION_STRING']), 
+        os.environ['TG_API_ID'], 
+        os.environ['TG_API_HASH'],
+        connection_retries=None,
+        retry_delay=5
+    )
     await client.start()
-    
     for link in links:
-        await process_single_link(client, link)
-        
+        result = await process_single_link(client, link)
+        if result == "LIMIT_REACHED":
+            break
     await client.disconnect()
-    print("\n✅ All links processed.")
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
