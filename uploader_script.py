@@ -58,7 +58,7 @@ def parse_filename(filename):
 # --- METADATA ENGINE ---
 async def get_metadata(filename):
     search_title, season, episode = parse_filename(filename)
-    print(f"🔍 Searching IMDb for: {search_title} " + (f"(S{season}E{episode})" if season else ""))
+    print(f"\n🔍 Searching IMDb for: {search_title} " + (f"(S{season}E{episode})" if season else ""))
     
     omdb_data = None
     if OMDB_API_KEY:
@@ -128,7 +128,7 @@ def generate_thumbnail_from_video(video_path):
 # --- VIDEO PROCESSING ---
 def process_video(input_path):
     output_path = "processed_video.mp4"
-    print(f"\n🔍 Optimizing video & audio...")
+    print(f"🔍 Optimizing video & audio...")
     # Keep video, keep English audio (or first track), convert to standard AAC
     cmd_ffmpeg = (
         f"ffmpeg -i '{input_path}' "
@@ -184,25 +184,27 @@ def upload_to_youtube(video_path, metadata, thumb_path):
     except Exception as e:
         print(f"🔴 YouTube Error: {e}")
 
-# --- MAIN ---
-async def run_flow(link):
+# --- SINGLE LINK HANDLER ---
+async def process_single_link(client, link):
     try:
+        print(f"\n--- Processing: {link} ---")
         parts = [p for p in link.strip('/').split('/') if p]
         msg_id = int(parts[-1])
         c_idx = parts.index('c')
         chat_id = int(f"-100{parts[c_idx+1]}")
-    except: return
+    except Exception as e:
+        print(f"❌ Skipping invalid link {link}: {e}")
+        return
 
-    client = TelegramClient(StringSession(os.environ['TG_SESSION_STRING']), os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
-    await client.start()
     message = await client.get_messages(chat_id, ids=msg_id)
-    if not message or not message.media: return
+    if not message or not message.media:
+        print("❌ Message contains no media.")
+        return
 
     raw_file = f"download_{msg_id}" + (message.file.ext if hasattr(message, 'file') else ".mp4")
     print(f"⬇️ Downloading from Telegram...")
     await client.download_media(message, raw_file, progress_callback=download_progress_callback)
-    await client.disconnect()
-
+    
     # Get Metadata (IMDb + AI formatting)
     metadata = await get_metadata(message.file.name or raw_file)
     
@@ -215,7 +217,23 @@ async def run_flow(link):
 
     # Cleanup
     for f in [raw_file, "processed_video.mp4", "thumbnail.jpg"]:
-        if os.path.exists(f): os.remove(f)
+        if os.path.exists(f): 
+            try: os.remove(f)
+            except: pass
+
+# --- MAIN ---
+async def run_flow(links_str):
+    links = [l.strip() for l in links_str.split(',') if l.strip()]
+    print(f"📦 Found {len(links)} links to process.")
+    
+    client = TelegramClient(StringSession(os.environ['TG_SESSION_STRING']), os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
+    await client.start()
+    
+    for link in links:
+        await process_single_link(client, link)
+        
+    await client.disconnect()
+    print("\n✅ All links processed.")
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
