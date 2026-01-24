@@ -100,22 +100,41 @@ def parse_telegram_link(link):
     Supports:
     - Public: https://t.me/username/123
     - Private: https://t.me/c/1234567890/123
+    - Private with Topic: https://t.me/c/1234567890/184/215
     """
     link = link.strip()
-    # Remove query parameters (e.g., ?single)
     if '?' in link:
         link = link.split('?')[0]
     
-    # Regex for Private Links (c/123456/789)
-    # Note: Telegram private link IDs usually need -100 prefix for Telethon
+    # Private Link Handling
+    if 't.me/c/' in link:
+        try:
+            # parsing https://t.me/c/CHANNEL_ID/TOPIC_ID/MSG_ID or CHANNEL_ID/MSG_ID
+            # Split by 't.me/c/' and take the right side, then split by '/'
+            path_parts = link.split('t.me/c/')[1].split('/')
+            
+            # Filter to keep only numeric parts (ignores empty strings or non-numeric segments)
+            numeric_parts = [p for p in path_parts if p.isdigit()]
+            
+            if len(numeric_parts) >= 2:
+                chat_id_str = numeric_parts[0]
+                msg_id = int(numeric_parts[-1]) # Always take the LAST number as the message ID
+                
+                chat_id = int(f"-100{chat_id_str}")
+                return chat_id, msg_id
+        except Exception:
+            pass # Fallback to other regex if this manual parse fails (unlikely)
+
+    # Legacy Regex for Standard Private Links (Just in case)
     private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if private_match:
+        # This might catch the topic ID if the loop above fails, but the loop above is safer.
         chat_id_str = private_match.group(1)
         msg_id = int(private_match.group(2))
         chat_id = int(f"-100{chat_id_str}")
         return chat_id, msg_id
 
-    # Regex for Public Links (username/789)
+    # Public Link Handling (username/id)
     public_match = re.search(r't\.me/([^/]+)/(\d+)', link)
     if public_match:
         username = public_match.group(1)
@@ -134,12 +153,12 @@ async def process_single_link(client, link):
             print(f"❌ Invalid Link Format: {link}")
             return True
 
+        print(f"🔍 Debug: Fetching Message ID {msg_id} from Chat {chat_id}")
+
         # Fetch Message
         try:
             message = await client.get_messages(chat_id, ids=msg_id)
         except ValueError:
-            # Sometimes private channels need to be accessed differently if not in cache
-            # But the user account must be joined to the channel
             print(f"❌ Cannot access chat. Ensure the account is a member of: {chat_id}")
             return True
         except Exception as e:
