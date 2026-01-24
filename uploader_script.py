@@ -35,8 +35,8 @@ async def fast_download(client, message, filename, progress_callback=None):
     document = msg_media.document if hasattr(msg_media, 'document') else msg_media
     file_size = document.size
     
-    # 1MB chunk size
-    part_size = 1024 * 1024 
+    # 10MB chunk size to reduce overhead and improve speed
+    part_size = 10 * 1024 * 1024 
     part_count = math.ceil(file_size / part_size)
     
     print(f"🚀 Starting Parallel Download ({PARALLEL_CHUNKS} threads) for {file_size/1024/1024:.2f} MB...")
@@ -70,18 +70,23 @@ async def fast_download(client, message, filename, progress_callback=None):
                 current_limit = min(part_size, file_size - offset)
                 
                 try:
-                    # Download specific chunk
-                    chunk = await client.download_file(
+                    # Use iter_download to stream the specific chunk range
+                    # This fixes the 'offset' argument error by using the correct method
+                    current_file_pos = offset
+                    async for chunk in client.iter_download(
                         message.media, 
                         offset=offset, 
-                        limit=current_limit
-                    )
-                    
-                    # Write safely
-                    async with file_lock:
-                        f.seek(offset)
-                        f.write(chunk)
-                        downloaded_bytes += len(chunk)
+                        limit=current_limit,
+                        request_size=512*1024 # Request larger blocks (512KB) from Telegram
+                    ):
+                        async with file_lock:
+                            f.seek(current_file_pos)
+                            f.write(chunk)
+                        
+                        chunk_len = len(chunk)
+                        current_file_pos += chunk_len
+                        downloaded_bytes += chunk_len
+                        
                         if progress_callback:
                             progress_callback(downloaded_bytes, file_size)
                             
