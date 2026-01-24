@@ -14,7 +14,7 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-PARALLEL_CHUNKS = 4 
+PARALLEL_CHUNKS = 20 
 
 class SpeedProgress:
     """Thread-safe progress tracker to prevent console spam and ghost text."""
