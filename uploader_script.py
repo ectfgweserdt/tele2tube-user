@@ -6,7 +6,6 @@ import math
 import time
 from telethon import TelegramClient, utils
 from telethon.sessions import StringSession 
-from telethon.network import MTProtoSender
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -27,13 +26,12 @@ class NASAProgress:
         self.lock = asyncio.Lock()
 
     async def update(self, current, total):
-        # Telethon calls this frequently; we throttle the UI
         async with self.lock:
             self.current = current
             now = time.time()
             if now - self.last_print > 0.5 or current == total:
                 self.last_print = now
-                perc = (current / total) * 100
+                perc = (current / total) * 100 if total > 0 else 0
                 elapsed = now - self.start_time
                 speed = (current / 1024 / 1024) / elapsed if elapsed > 0 else 0
                 sys.stdout.write(
@@ -45,9 +43,8 @@ class NASAProgress:
 
 async def fast_download(client, message, filename):
     """
-    Highly optimized parallel downloader using a pool of MTProto connections.
-    This avoids the 'stuck at 99%' bug by using Telethon's managed download logic
-    but scaled across multiple senders.
+    Highly optimized parallel downloader using Telethon's internal connection pooling.
+    Fixed: Moved 'request_threads' to download_media where it belongs.
     """
     if not message or not message.media:
         return None
@@ -55,12 +52,10 @@ async def fast_download(client, message, filename):
     file_size = message.file.size
     progress = NASAProgress(file_size)
 
-    # This is the "secret sauce" for speed. We tell Telethon to use 
-    # multiple connections specifically for this download.
-    # We do NOT use manual chunking to avoid protocol errors.
     print(f"🚀 Initializing {MAX_CONNECTIONS} parallel MTProto streams...")
     
-    start_time = time.time()
+    # Telethon uses 'request_threads' inside download_media to enable 
+    # multi-connection parallel downloading.
     path = await client.download_media(
         message,
         file=filename,
@@ -99,6 +94,7 @@ def upload_to_youtube(video_path, metadata):
         }
         
         print(f"🚀 Uploading to YouTube: {body['snippet']['title']}")
+        # Using larger chunksize for faster YouTube upload on high-bandwidth servers
         media = MediaFileUpload(video_path, chunksize=1024*1024*5, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         
@@ -142,7 +138,7 @@ async def process_single_link(client, link):
         
         if os.path.exists(raw_file): os.remove(raw_file)
 
-        # NASA Tier Download
+        # Start NASA Speed Download
         await fast_download(client, message, raw_file)
         
         # Metadata and Upload
@@ -158,12 +154,11 @@ async def process_single_link(client, link):
 async def run_flow(links_str):
     links = [l.strip() for l in links_str.split(',') if l.strip()]
     try:
-        # We set max_retry to high and parallel_queries to MAX_CONNECTIONS
+        # Standard initialization
         client = TelegramClient(
             StringSession(os.environ['TG_SESSION_STRING']), 
             int(os.environ['TG_API_ID']), 
-            os.environ['TG_API_HASH'],
-            max_concurrent_downloads=MAX_CONNECTIONS # This tells Telethon to use a connection pool
+            os.environ['TG_API_HASH']
         )
         await client.start()
         for link in links:
