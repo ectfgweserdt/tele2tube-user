@@ -14,25 +14,37 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-PARALLEL_CHUNKS = 4  # Number of parallel downloads.
+PARALLEL_CHUNKS = 4 
 
-# Global to track last print time to prevent spam
-last_print_time = 0
+class SpeedProgress:
+    """Thread-safe progress tracker to prevent console spam and ghost text."""
+    def __init__(self, total_size):
+        self.total = total_size
+        self.current = 0
+        self.last_print = 0
+        self.lock = asyncio.Lock()
+        self.finished = False
 
-def download_progress_callback(current, total):
-    global last_print_time
-    now = time.time()
-    
-    # Only print if 0.5 seconds passed OR it's the final byte (100%)
-    if total and (now - last_print_time > 0.5 or current == total):
-        last_print_time = now
-        percentage = min(100.0, current * 100 / total)
-        print(f"⬇️ Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({percentage:.1f}%)", end='\r')
+    async def update(self, chunk_size):
+        async with self.lock:
+            self.current += chunk_size
+            now = time.time()
+            # Throttled printing (every 0.3s) or final 100%
+            if now - self.last_print > 0.3 or self.current >= self.total:
+                if not self.finished:
+                    self.last_print = now
+                    percentage = min(100.0, self.current * 100 / self.total)
+                    # \033[K clears the rest of the line to prevent ghost characters
+                    sys.stdout.write(
+                        f"\r⬇️ Download: {self.current/1024/1024:.2f}MB / {self.total/1024/1024:.2f}MB ({percentage:.1f}%) \033[K"
+                    )
+                    sys.stdout.flush()
+                    if self.current >= self.total:
+                        self.finished = True
+                        print(f"\n✅ Fast Download Complete.")
 
-async def fast_download(client, message, filename, progress_callback=None):
-    """
-    Downloads a file in parallel chunks with NASA-tier speed and no console spam.
-    """
+async def fast_download(client, message, filename):
+    """Downloads file in parallel chunks with proper concurrency management."""
     msg_media = message.media
     if not msg_media:
         return None
@@ -43,21 +55,19 @@ async def fast_download(client, message, filename, progress_callback=None):
     part_size = 10 * 1024 * 1024 # 10MB chunks
     part_count = math.ceil(file_size / part_size)
     
-    print(f"🚀 Starting Fast Download ({PARALLEL_CHUNKS} threads) for {file_size/1024/1024:.2f} MB...")
+    print(f"🚀 Starting Fast Download ({PARALLEL_CHUNKS} threads) | Total: {file_size/1024/1024:.2f} MB")
 
+    progress = SpeedProgress(file_size)
     file_lock = asyncio.Lock()
-    progress_lock = asyncio.Lock()
-    downloaded_bytes = 0
     
     with open(filename, 'wb') as f:
-        f.truncate(file_size)
+        f.truncate(file_size) # Pre-allocate
         
         queue = asyncio.Queue()
         for i in range(part_count):
             queue.put_nowait(i)
             
         async def worker():
-            nonlocal downloaded_bytes
             while not queue.empty():
                 try:
                     part_index = queue.get_nowait()
@@ -76,20 +86,16 @@ async def fast_download(client, message, filename, progress_callback=None):
                         request_size=512*1024 
                     ):
                         chunk_len = len(chunk)
-                        
                         async with file_lock:
                             f.seek(current_file_pos)
                             f.write(chunk)
                         
                         current_file_pos += chunk_len
-                        
-                        async with progress_lock:
-                            downloaded_bytes += chunk_len
-                            if progress_callback:
-                                progress_callback(min(downloaded_bytes, file_size), file_size)
+                        await progress.update(chunk_len)
                             
                 except Exception as e:
-                    print(f"⚠️ Chunk {part_index} failed, retrying...")
+                    print(f"\n⚠️ Chunk {part_index} failed, retrying... ({str(e)[:50]})")
+                    await asyncio.sleep(1)
                     queue.put_nowait(part_index) 
                 finally:
                     queue.task_done()
@@ -97,17 +103,14 @@ async def fast_download(client, message, filename, progress_callback=None):
         tasks = [asyncio.create_task(worker()) for _ in range(PARALLEL_CHUNKS)]
         await asyncio.gather(*tasks)
 
-    print(f"\n✅ Fast Download Complete: {filename}")
     return filename
 
 def get_simple_metadata(message, filename):
     clean_name = os.path.splitext(filename)[0]
     title = clean_name.replace('_', ' ').replace('.', ' ').strip()
-    if len(title) > 95:
-        title = title[:95]
+    if len(title) > 95: title = title[:95]
     description = message.message if message.message else f"Uploaded from Telegram: {title}"
-    tags = ["Telegram", "Video", "Upload"]
-    return {"title": title, "description": description, "tags": tags}
+    return {"title": title, "description": description, "tags": ["Telegram", "Video"]}
 
 def upload_to_youtube(video_path, metadata):
     try:
@@ -139,60 +142,44 @@ def upload_to_youtube(video_path, metadata):
         while response is None:
             status, response = request.next_chunk()
             if status:
-                print(f"⬆️ Upload: {int(status.progress() * 100)}%", end='\r')
+                print(f"⬆️ Upload: {int(status.progress() * 100)}% \033[K", end='\r')
         
         print(f"\n🎉 SUCCESS! https://youtu.be/{response['id']}")
         return True
-
-    except googleapiclient.errors.HttpError as e:
-        error_details = e.content.decode()
-        if "uploadLimitExceeded" in error_details or "quotaExceeded" in error_details:
-            print("\n❌ YOUTUBE QUOTA EXCEEDED!")
-            return "LIMIT_REACHED"
-        print(f"\n🔴 YT HTTP Error: {e}")
-        return False
     except Exception as e:
-        print(f"\n🔴 Upload Error: {e}")
+        print(f"\n🔴 YT Error: {e}")
         return False
 
 def parse_telegram_link(link):
     link = link.strip()
-    if '?' in link:
-        link = link.split('?')[0]
+    if '?' in link: link = link.split('?')[0]
     if 't.me/c/' in link:
         try:
             path_parts = link.split('t.me/c/')[1].split('/')
             numeric_parts = [p for p in path_parts if p.isdigit()]
             if len(numeric_parts) >= 2:
-                chat_id = int(f"-100{numeric_parts[0]}")
-                msg_id = int(numeric_parts[-1])
-                return chat_id, msg_id
+                return int(f"-100{numeric_parts[0]}"), int(numeric_parts[-1])
         except: pass
     public_match = re.search(r't\.me/([^/]+)/(\d+)', link)
-    if public_match:
-        return public_match.group(1), int(public_match.group(2))
+    if public_match: return public_match.group(1), int(public_match.group(2))
     return None, None
 
 async def process_single_link(client, link):
     try:
         print(f"\n--- Processing: {link} ---")
         chat_id, msg_id = parse_telegram_link(link)
-        if not chat_id or not msg_id:
-            print(f"❌ Invalid Link: {link}")
-            return True
+        if not chat_id or not msg_id: return True
 
         message = await client.get_messages(chat_id, ids=msg_id)
-        if not message or not message.media:
-            print("❌ No media found.")
-            return True
+        if not message or not message.media: return True
 
-        original_filename = message.file.name if hasattr(message.file, 'name') and message.file.name else f"video_{msg_id}.mp4"
-        raw_file = f"dl_{msg_id}_{original_filename}"
+        fname = message.file.name if hasattr(message.file, 'name') and message.file.name else f"video_{msg_id}.mp4"
+        raw_file = f"dl_{msg_id}_{fname}"
         
         if os.path.exists(raw_file): os.remove(raw_file)
 
-        await fast_download(client, message, raw_file, progress_callback=download_progress_callback)
-        metadata = get_simple_metadata(message, original_filename)
+        await fast_download(client, message, raw_file)
+        metadata = get_simple_metadata(message, fname)
         status = upload_to_youtube(raw_file, metadata)
 
         if os.path.exists(raw_file): os.remove(raw_file)
@@ -204,11 +191,8 @@ async def process_single_link(client, link):
 async def run_flow(links_str):
     links = [l.strip() for l in links_str.split(',') if l.strip()]
     try:
-        client = TelegramClient(
-            StringSession(os.environ['TG_SESSION_STRING']), 
-            int(os.environ['TG_API_ID']), 
-            os.environ['TG_API_HASH']
-        )
+        client = TelegramClient(StringSession(os.environ['TG_SESSION_STRING']), 
+                                int(os.environ['TG_API_ID']), os.environ['TG_API_HASH'])
         await client.start()
         for link in links:
             if await process_single_link(client, link) == "LIMIT_REACHED": break
