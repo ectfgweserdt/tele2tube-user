@@ -2,7 +2,8 @@ import os
 import sys
 import asyncio
 import re
-from telethon import TelegramClient
+import math
+from telethon import TelegramClient, utils
 from telethon.sessions import StringSession 
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -12,6 +13,7 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+PARALLEL_CHUNKS = 4  # Number of parallel downloads. 4 is usually optimal.
 
 # Fetching API Keys
 # Note: GEMINI and OMDB keys are no longer needed for simple mode
@@ -20,6 +22,81 @@ def download_progress_callback(current, total):
     # Simple progress indicator
     if total:
         print(f"⬇️ Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.1f}%)", end='\r')
+
+async def fast_download(client, message, filename, progress_callback=None):
+    """
+    Downloads a file in parallel chunks to maximize speed, then stitches them together.
+    """
+    msg_media = message.media
+    if not msg_media:
+        return None
+        
+    # Get file size and attributes
+    document = msg_media.document if hasattr(msg_media, 'document') else msg_media
+    file_size = document.size
+    
+    # 1MB chunk size
+    part_size = 1024 * 1024 
+    part_count = math.ceil(file_size / part_size)
+    
+    print(f"🚀 Starting Parallel Download ({PARALLEL_CHUNKS} threads) for {file_size/1024/1024:.2f} MB...")
+
+    # Create a lock for file writing (since we are async)
+    file_lock = asyncio.Lock()
+    
+    # Tracking progress
+    downloaded_bytes = 0
+    
+    with open(filename, 'wb') as f:
+        # Pre-allocate file size (optional but good for performance)
+        f.seek(file_size - 1)
+        f.write(b'\0')
+        f.seek(0)
+        
+        queue = asyncio.Queue()
+        for i in range(part_count):
+            queue.put_nowait(i)
+            
+        async def worker():
+            nonlocal downloaded_bytes
+            while not queue.empty():
+                try:
+                    part_index = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                
+                offset = part_index * part_size
+                # Calculate limit for this chunk (might be smaller for last chunk)
+                current_limit = min(part_size, file_size - offset)
+                
+                try:
+                    # Download specific chunk
+                    chunk = await client.download_file(
+                        message.media, 
+                        offset=offset, 
+                        limit=current_limit
+                    )
+                    
+                    # Write safely
+                    async with file_lock:
+                        f.seek(offset)
+                        f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        if progress_callback:
+                            progress_callback(downloaded_bytes, file_size)
+                            
+                except Exception as e:
+                    print(f"⚠️ Chunk {part_index} failed, retrying... ({e})")
+                    queue.put_nowait(part_index) # Retry
+                finally:
+                    queue.task_done()
+
+        # Start workers
+        tasks = [asyncio.create_task(worker()) for _ in range(PARALLEL_CHUNKS)]
+        await asyncio.gather(*tasks)
+
+    print(f"\n✅ Fast Download Complete: {filename}")
+    return filename
 
 def get_simple_metadata(message, filename):
     """
@@ -182,9 +259,8 @@ async def process_single_link(client, link):
         if os.path.exists(raw_file):
             os.remove(raw_file)
 
-        print(f"⬇️ Downloading: {original_filename}")
-        await client.download_media(message, raw_file, progress_callback=download_progress_callback)
-        print("\n✅ Download Complete.")
+        # USE FAST DOWNLOADER
+        await fast_download(client, message, raw_file, progress_callback=download_progress_callback)
         
         # Get Metadata
         metadata = get_simple_metadata(message, original_filename)
