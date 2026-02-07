@@ -65,12 +65,24 @@ async def analyze_with_ai(text_content):
 # --- Telegram Link Resolver ---
 
 async def resolve_telegram_message(client, link):
+    """
+    Improved resolver to handle topic-based links like /channel/topic/msg_id
+    """
     try:
-        parts = link.strip('/').split('/')
-        msg_id = int(parts[-1])
+        # Clean the link and split into segments
+        clean_link = link.strip().replace('https://t.me/', '').replace('http://t.me/', '')
+        parts = [p for p in clean_link.split('/') if p]
         
-        if 't.me/c/' in link:
-            raw_id = parts[-2] if len(parts) == 5 else parts[-3]
+        # In a link like sr25theoryeduzone/580/584
+        # parts[0] = sr25theoryeduzone (The actual entity)
+        # parts[-1] = 584 (The actual message ID)
+        
+        msg_id = int(parts[-1])
+        target_entity = parts[0]
+
+        if target_entity == 'c':
+            # Private link format: t.me/c/ID/MSG_ID or t.me/c/ID/TOPIC/MSG_ID
+            raw_id = parts[1]
             chat_id = int(f"-100{raw_id}")
             try:
                 entity = await client.get_entity(chat_id)
@@ -79,8 +91,8 @@ async def resolve_telegram_message(client, link):
                 await client.get_dialogs()
                 entity = await client.get_entity(chat_id)
         else:
-            chat_username = parts[-2]
-            entity = await client.get_entity(chat_username)
+            # Public link format: t.me/username/MSG_ID or t.me/username/TOPIC/MSG_ID
+            entity = await client.get_entity(target_entity)
 
         message = await client.get_messages(entity, ids=msg_id)
         return message, entity
