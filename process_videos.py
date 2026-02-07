@@ -24,6 +24,16 @@ YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
 VIDEO_LINKS = [l.strip() for l in os.environ.get('VIDEO_LINKS', '').split(',') if l.strip()]
 
+# Fail-safe mapping for Physics Units
+UNIT_MAPPING = {
+    "තාපය": "Heat",
+    "යාන්ත්‍ර": "Mechanics",
+    "ආලෝකය": "Light",
+    "තරංග": "Waves",
+    "විද්‍යුත්": "Electricity",
+    "පදාර්ථ": "Properties of Matter"
+}
+
 # --- UI Helpers ---
 
 def log_header(text):
@@ -47,7 +57,14 @@ async def analyze_with_ai(text_content):
     endpoint = "https://models.inference.ai.azure.com/chat/completions"
     headers = {"Authorization": f"Bearer {GH_TOKEN}", "Content-Type": "application/json"}
     
-    prompt = f"Analyze this Physics tuition post: '{text_content}'. Provide a professional English title and the Physics Unit (Heat, Mechanics, etc). Return ONLY JSON: {{\"title\":\"...\", \"category\":\"...\"}}"
+    prompt = f"""
+    Analyze this Physics tuition post: '{text_content}'
+    1. Translate Sinhala words to English (e.g. 'තාපය' to 'Heat').
+    2. Provide a professional English title.
+    3. Identify the Physics Unit (Heat, Mechanics, etc).
+    
+    Return ONLY a JSON object: {{"title":"English Title", "category":"Unit Name"}}
+    """
     
     try:
         response = requests.post(endpoint, headers=headers, json={
@@ -55,33 +72,65 @@ async def analyze_with_ai(text_content):
             "model": "gpt-4o-mini",
             "temperature": 0.1
         }, timeout=30)
+        
         data = response.json()
-        raw = data['choices'][0]['message']['content']
-        return json.loads(re.search(r'\{.*\}', raw, re.DOTALL).group())
+        raw_content = data['choices'][0]['message']['content']
+        
+        # Robust JSON extraction
+        match = re.search(r'\{.*\}', raw_content, re.DOTALL)
+        result = json.loads(match.group()) if match else json.loads(raw_content)
+        
+        # Fail-safe: If title still contains Sinhala, use manual mapping
+        for sin, eng in UNIT_MAPPING.items():
+            if sin in result['title']:
+                result['title'] = result['title'].replace(sin, eng)
+                if result['category'] == 'General':
+                    result['category'] = eng
+                    
+        return result
     except Exception as e:
-        log_status("AI ERROR", str(e))
-        return {"title": text_content[:50], "category": "General"}
+        log_status("AI ERROR", f"Falling back to mapping: {e}")
+        # Manual fallback logic
+        cat = "General"
+        title = text_content.replace('*', '').strip()
+        for sin, eng in UNIT_MAPPING.items():
+            if sin in text_content:
+                cat = eng
+                title = title.replace(sin, eng)
+                break
+        return {"title": title, "category": cat}
+
+# --- YouTube Helpers ---
+
+def get_or_create_playlist(youtube, title):
+    try:
+        request = youtube.playlists().list(part="snippet", mine=True, maxResults=50)
+        response = request.execute()
+        for item in response.get('items', []):
+            if item['snippet']['title'].lower() == title.lower():
+                return item['id']
+        
+        log_status("PLAYLIST", f"Creating new playlist: {title}")
+        res = youtube.playlists().insert(part="snippet,status", body={
+            "snippet": {"title": title, "description": "Automatically categorized tuition videos."},
+            "status": {"privacyStatus": "private"}
+        }).execute()
+        return res['id']
+    except Exception as e:
+        log_status("PL ERROR", str(e))
+        return None
 
 # --- Telegram Link Resolver ---
 
 async def resolve_telegram_message(client, link):
-    """
-    Improved resolver to handle topic-based links like /channel/topic/msg_id
-    """
     try:
-        # Clean the link and split into segments
         clean_link = link.strip().replace('https://t.me/', '').replace('http://t.me/', '')
         parts = [p for p in clean_link.split('/') if p]
-        
-        # In a link like sr25theoryeduzone/580/584
-        # parts[0] = sr25theoryeduzone (The actual entity)
-        # parts[-1] = 584 (The actual message ID)
         
         msg_id = int(parts[-1])
         target_entity = parts[0]
 
         if target_entity == 'c':
-            # Private link format: t.me/c/ID/MSG_ID or t.me/c/ID/TOPIC/MSG_ID
             raw_id = parts[1]
             chat_id = int(f"-100{raw_id}")
             try:
@@ -91,7 +140,6 @@ async def resolve_telegram_message(client, link):
                 await client.get_dialogs()
                 entity = await client.get_entity(chat_id)
         else:
-            # Public link format: t.me/username/MSG_ID or t.me/username/TOPIC/MSG_ID
             entity = await client.get_entity(target_entity)
 
         message = await client.get_messages(entity, ids=msg_id)
@@ -112,17 +160,17 @@ async def main():
     log_header("TELE2TUBE: TUITION VIDEO PROCESSOR")
     
     if not VIDEO_LINKS:
-        log_status("ERROR", "No video links provided in environment variables.")
+        log_status("ERROR", "No video links provided.")
         return
 
     client = TelegramClient(StringSession(TG_SESSION_STRING), int(TG_API_ID), TG_API_HASH)
-    log_status("TELEGRAM", "Connecting to client...")
+    log_status("TELEGRAM", "Connecting...")
     await client.connect()
     
-    log_status("CACHE", "Pre-fetching dialogs (this may take a moment)...")
+    log_status("CACHE", "Refreshing dialogs...")
     await client.get_dialogs()
     
-    log_status("YOUTUBE", "Initializing YouTube API...")
+    log_status("YOUTUBE", "Initializing API...")
     creds = Credentials(None, refresh_token=YOUTUBE_REFRESH_TOKEN, 
                         token_uri="https://oauth2.googleapis.com/token",
                         client_id=YOUTUBE_CLIENT_ID, client_secret=YOUTUBE_CLIENT_SECRET)
@@ -135,37 +183,32 @@ async def main():
         message, entity = await resolve_telegram_message(client, link)
         
         if not message or not message.media:
-            log_status("SKIP", "No media or message found.")
+            log_status("SKIP", "No media found.")
             continue
 
         # 1. AI Analysis
-        log_status("AI", "Analyzing text and translating...")
+        log_status("AI", "Translating and Categorizing...")
         text = message.text or message.caption or "Untitled Video"
         metadata = await analyze_with_ai(text)
         
-        print(f"\n  > Translated Title: {metadata['title']}")
-        print(f"  > Target Unit:     {metadata['category']}\n")
+        print(f"\n  > FINAL TITLE: {metadata['title']}")
+        print(f"  > PLAYLIST:    {metadata['category']}\n")
 
         # 2. Download
-        log_status("DOWNLOAD", "Starting media download...")
-        if not os.path.exists("downloads"):
-            os.makedirs("downloads")
-            
+        if not os.path.exists("downloads"): os.makedirs("downloads")
         path = await client.download_media(message, file="downloads/", progress_callback=download_progress)
-        print() # Move to next line after progress bar
+        print() 
         
-        if not path:
-            log_status("ERROR", "Download failed.")
-            continue
+        if not path: continue
 
         # 3. Upload to YouTube
-        log_status("UPLOAD", f"Preparing YouTube upload ({format_size(os.path.getsize(path))})...")
+        log_status("UPLOAD", f"Uploading {format_size(os.path.getsize(path))}...")
         try:
             request_body = {
                 'snippet': {
                     'title': metadata['title'],
-                    'description': f"Automated upload from Telegram.\n\nOriginal Text:\n{text}",
-                    'categoryId': '27' # Education
+                    'description': f"Original Text:\n{text}",
+                    'categoryId': '27'
                 },
                 'status': {'privacyStatus': 'private'}
             }
@@ -179,10 +222,21 @@ async def main():
                 if status:
                     print(f"\r[UPLOAD      ] Progress: {int(status.progress() * 100):>3}% uploaded...", end="")
             
-            print(f"\n[UPLOAD      ] SUCCESS! Video ID: {response['id']}")
+            video_id = response['id']
+            print(f"\n[UPLOAD      ] SUCCESS! ID: {video_id}")
             
-            # 4. Cleanup
-            log_status("CLEANUP", "Deleting local file...")
+            # 4. Playlist Assignment
+            playlist_id = get_or_create_playlist(youtube, metadata['category'])
+            if playlist_id:
+                youtube.playlistItems().insert(part="snippet", body={
+                    "snippet": {
+                        "playlistId": playlist_id,
+                        "resourceId": {"kind": "youtube#video", "videoId": video_id}
+                    }
+                }).execute()
+                log_status("PLAYLIST", f"Added to '{metadata['category']}'")
+            
+            # 5. Cleanup
             os.remove(path)
             
         except Exception as e:
