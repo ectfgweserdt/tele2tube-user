@@ -24,14 +24,19 @@ YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
 VIDEO_LINKS = [l.strip() for l in os.environ.get('VIDEO_LINKS', '').split(',') if l.strip()]
 
-# Fail-safe mapping for Physics Units
-UNIT_MAPPING = {
+# Strict Translation Dictionary for Physics
+# This ensures even if AI fails, the core unit is translated.
+TRANSLATION_DICT = {
     "තාපය": "Heat",
     "යාන්ත්‍ර": "Mechanics",
     "ආලෝකය": "Light",
     "තරංග": "Waves",
     "විද්‍යුත්": "Electricity",
-    "පදාර්ථ": "Properties of Matter"
+    "පදාර්ථ": "Properties of Matter",
+    "ගුණ": "Properties",
+    "ස්ථිති": "Electrostatics",
+    "චුම්භක": "Magnetic",
+    "නවීන": "Modern Physics"
 }
 
 # --- UI Helpers ---
@@ -42,65 +47,72 @@ def log_header(text):
 def log_status(step, status):
     print(f"[{step.upper():<12}] {status}")
 
-def format_size(bytes):
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if bytes < 1024.0:
-            return f"{bytes:.2f} {unit}"
-        bytes /= 1024.0
+def has_sinhala(text):
+    """Detects if string contains Sinhala characters."""
+    return bool(re.search(r'[\u0D80-\u0DFF]', text))
 
-# --- AI & Translation Logic ---
+def sanitize_title(text):
+    """Manually translates keywords if AI leaves Sinhala text."""
+    temp_text = text
+    for sin, eng in TRANSLATION_DICT.items():
+        temp_text = re.sub(sin, eng, temp_text, flags=re.IGNORECASE)
+    # Remove emojis and markdown junk
+    temp_text = re.sub(r'[^\x00-\x7F]+', '', temp_text).strip()
+    return temp_text if temp_text else "Physics Lesson"
+
+# --- AI Logic ---
 
 async def analyze_with_ai(text_content):
     if not GH_TOKEN or not text_content:
-        return {"title": text_content or "Untitled", "category": "General"}
+        return {"title": "Physics Lesson", "category": "General Physics"}
         
     endpoint = "https://models.inference.ai.azure.com/chat/completions"
     headers = {"Authorization": f"Bearer {GH_TOKEN}", "Content-Type": "application/json"}
     
+    # Highly specific prompt
     prompt = f"""
-    Analyze this Physics tuition post: '{text_content}'
-    1. Translate Sinhala words to English (e.g. 'තාපය' to 'Heat').
-    2. Provide a professional English title.
-    3. Identify the Physics Unit (Heat, Mechanics, etc).
+    Translate the following Sinhala tuition text into a professional English YouTube Title and identify the Physics Unit.
     
-    Return ONLY a JSON object: {{"title":"English Title", "category":"Unit Name"}}
+    Text: "{text_content}"
+    
+    Rules:
+    1. The 'title' MUST be in English ONLY.
+    2. 'category' MUST be the Physics Unit name (e.g., Heat, Mechanics, Waves).
+    3. If the unit is unknown, use 'General Physics'.
+    4. Respond ONLY with valid JSON.
     """
     
     try:
         response = requests.post(endpoint, headers=headers, json={
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": "You are a translation bot that only outputs valid JSON. No conversational text."},
+                {"role": "user", "content": prompt}
+            ],
             "model": "gpt-4o-mini",
-            "temperature": 0.1
-        }, timeout=30)
+            "temperature": 0.0 # Strictness set to maximum
+        }, timeout=25)
         
-        data = response.json()
-        raw_content = data['choices'][0]['message']['content']
-        
-        # Robust JSON extraction
+        raw_content = response.json()['choices'][0]['message']['content']
         match = re.search(r'\{.*\}', raw_content, re.DOTALL)
         result = json.loads(match.group()) if match else json.loads(raw_content)
         
-        # Fail-safe: If title still contains Sinhala, use manual mapping
-        for sin, eng in UNIT_MAPPING.items():
-            if sin in result['title']:
-                result['title'] = result['title'].replace(sin, eng)
-                if result['category'] == 'General':
-                    result['category'] = eng
-                    
+        # Double-check if the AI ignored the 'English ONLY' rule
+        if has_sinhala(result['title']):
+            log_status("AI WARN", "AI returned Sinhala. Forcing manual translation.")
+            result['title'] = sanitize_title(result['title'])
+            
         return result
     except Exception as e:
-        log_status("AI ERROR", f"Falling back to mapping: {e}")
-        # Manual fallback logic
-        cat = "General"
-        title = text_content.replace('*', '').strip()
-        for sin, eng in UNIT_MAPPING.items():
+        log_status("AI FAIL", f"Using dictionary fallback: {e}")
+        # Manual fallback
+        category = "General Physics"
+        for sin, eng in TRANSLATION_DICT.items():
             if sin in text_content:
-                cat = eng
-                title = title.replace(sin, eng)
+                category = eng
                 break
-        return {"title": title, "category": cat}
+        return {"title": sanitize_title(text_content), "category": category}
 
-# --- YouTube Helpers ---
+# --- YouTube Logic ---
 
 def get_or_create_playlist(youtube, title):
     try:
@@ -110,67 +122,45 @@ def get_or_create_playlist(youtube, title):
             if item['snippet']['title'].lower() == title.lower():
                 return item['id']
         
-        log_status("PLAYLIST", f"Creating new playlist: {title}")
+        log_status("PLAYLIST", f"Creating: {title}")
         res = youtube.playlists().insert(part="snippet,status", body={
-            "snippet": {"title": title, "description": "Automatically categorized tuition videos."},
+            "snippet": {"title": title, "description": "Physics tuition videos."},
             "status": {"privacyStatus": "private"}
         }).execute()
         return res['id']
     except Exception as e:
-        log_status("PL ERROR", str(e))
+        log_status("PL ERROR", f"Could not create playlist: {e}")
         return None
 
-# --- Telegram Link Resolver ---
+# --- Main App ---
 
 async def resolve_telegram_message(client, link):
     try:
-        clean_link = link.strip().replace('https://t.me/', '').replace('http://t.me/', '')
+        clean_link = link.strip().split('t.me/')[1]
         parts = [p for p in clean_link.split('/') if p]
-        
         msg_id = int(parts[-1])
-        target_entity = parts[0]
-
-        if target_entity == 'c':
-            raw_id = parts[1]
-            chat_id = int(f"-100{raw_id}")
+        target = parts[0]
+        
+        if target == 'c':
+            chat_id = int(f"-100{parts[1]}")
             try:
                 entity = await client.get_entity(chat_id)
-            except ValueError:
-                log_status("TELEGRAM", f"Chat {chat_id} not in cache. Refreshing...")
+            except:
                 await client.get_dialogs()
                 entity = await client.get_entity(chat_id)
         else:
-            entity = await client.get_entity(target_entity)
-
+            entity = await client.get_entity(target)
+            
         message = await client.get_messages(entity, ids=msg_id)
         return message, entity
-    except Exception as e:
-        log_status("RESOLVE ERR", f"Failed for {link}: {e}")
-        return None, None
-
-# --- Progress Callbacks ---
-
-def download_progress(current, total):
-    percent = (current / total) * 100
-    print(f"\r[DOWNLOAD    ] Progress: {percent:>5.1f}% | {format_size(current)} / {format_size(total)}", end="")
-
-# --- Main Logic ---
+    except: return None, None
 
 async def main():
     log_header("TELE2TUBE: TUITION VIDEO PROCESSOR")
-    
-    if not VIDEO_LINKS:
-        log_status("ERROR", "No video links provided.")
-        return
-
     client = TelegramClient(StringSession(TG_SESSION_STRING), int(TG_API_ID), TG_API_HASH)
-    log_status("TELEGRAM", "Connecting...")
     await client.connect()
-    
-    log_status("CACHE", "Refreshing dialogs...")
     await client.get_dialogs()
     
-    log_status("YOUTUBE", "Initializing API...")
     creds = Credentials(None, refresh_token=YOUTUBE_REFRESH_TOKEN, 
                         token_uri="https://oauth2.googleapis.com/token",
                         client_id=YOUTUBE_CLIENT_ID, client_secret=YOUTUBE_CLIENT_SECRET)
@@ -178,71 +168,54 @@ async def main():
 
     for i, link in enumerate(VIDEO_LINKS, 1):
         log_header(f"ITEM {i} OF {len(VIDEO_LINKS)}")
-        log_status("LINK", link)
-        
-        message, entity = await resolve_telegram_message(client, link)
+        message, _ = await resolve_telegram_message(client, link)
         
         if not message or not message.media:
             log_status("SKIP", "No media found.")
             continue
 
-        # 1. AI Analysis
-        log_status("AI", "Translating and Categorizing...")
-        text = message.text or message.caption or "Untitled Video"
+        log_status("PROCESS", "Analyzing & Translating...")
+        text = message.text or message.caption or ""
         metadata = await analyze_with_ai(text)
         
-        print(f"\n  > FINAL TITLE: {metadata['title']}")
-        print(f"  > PLAYLIST:    {metadata['category']}\n")
+        # FINAL LOGGING FOR USER
+        print(f"  > AI TITLE:    {metadata['title']}")
+        print(f"  > AI UNIT:     {metadata['category']}")
 
-        # 2. Download
         if not os.path.exists("downloads"): os.makedirs("downloads")
-        path = await client.download_media(message, file="downloads/", progress_callback=download_progress)
-        print() 
+        path = await client.download_media(message, file="downloads/")
         
-        if not path: continue
-
-        # 3. Upload to YouTube
-        log_status("UPLOAD", f"Uploading {format_size(os.path.getsize(path))}...")
-        try:
-            request_body = {
-                'snippet': {
-                    'title': metadata['title'],
-                    'description': f"Original Text:\n{text}",
-                    'categoryId': '27'
-                },
+        if path:
+            log_status("UPLOAD", f"Uploading video to YouTube...")
+            body = {
+                'snippet': {'title': metadata['title'], 'description': text, 'categoryId': '27'},
                 'status': {'privacyStatus': 'private'}
             }
-            
             media = MediaFileUpload(path, chunksize=10*1024*1024, resumable=True)
-            request = youtube.videos().insert(part="snippet,status", body=request_body, media_body=media)
+            request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
             
             response = None
             while response is None:
                 status, response = request.next_chunk()
                 if status:
-                    print(f"\r[UPLOAD      ] Progress: {int(status.progress() * 100):>3}% uploaded...", end="")
+                    print(f"\r[UPLOAD] {int(status.progress() * 100)}%", end="")
             
             video_id = response['id']
-            print(f"\n[UPLOAD      ] SUCCESS! ID: {video_id}")
+            print(f"\n[UPLOAD] Success: {video_id}")
             
-            # 4. Playlist Assignment
-            playlist_id = get_or_create_playlist(youtube, metadata['category'])
-            if playlist_id:
+            # Playlist Logic
+            pid = get_or_create_playlist(youtube, metadata['category'])
+            if pid:
                 youtube.playlistItems().insert(part="snippet", body={
                     "snippet": {
-                        "playlistId": playlist_id,
+                        "playlistId": pid,
                         "resourceId": {"kind": "youtube#video", "videoId": video_id}
                     }
                 }).execute()
-                log_status("PLAYLIST", f"Added to '{metadata['category']}'")
+                log_status("PLAYLIST", f"Added to {metadata['category']}")
             
-            # 5. Cleanup
             os.remove(path)
-            
-        except Exception as e:
-            log_status("YT ERROR", f"Upload failed: {e}")
 
-    log_header("ALL PROCESSES COMPLETE")
     await client.disconnect()
 
 if __name__ == '__main__':
