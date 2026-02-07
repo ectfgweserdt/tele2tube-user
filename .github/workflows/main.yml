@@ -1,38 +1,38 @@
-name: Fast Telegram to YouTube Bot
+name: Telegram to YouTube Uploader
 
 on:
   workflow_dispatch:
     inputs:
-      telegram_link:
-        description: 'Telegram Links (Comma separated)'
+      video_links:
+        description: 'Telegram Video Links (comma separated)'
         required: true
         type: string
 
-# Ensure only one upload runs at a time
-concurrency: 
-  group: telegram-upload
-  cancel-in-progress: false 
-
 jobs:
-  upload:
+  process_tuition:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      - name: Install Tools
+          python-version: '3.10'
+
+      - name: Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-      - name: Install High-Speed Libraries
-        run: pip install --no-cache-dir -r requirements.txt
-      - name: Execute
+          pip install -r requirements.txt
+
+      - name: Run Processor
         env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-        run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
+          VIDEO_LINKS: ${{ inputs.video_links }}
+        run: python process_videos.py
